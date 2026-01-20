@@ -1,0 +1,20 @@
+# Models are too large for git
+models/*.safetensors
+models/*.ckpt
+loras/*.safetensors
+loras/*.pt
+
+# Outputs
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/

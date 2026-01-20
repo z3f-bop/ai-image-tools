@@ -1,0 +1,20 @@
+[project]
+name = "ai-image-tools"
+version = "0.1.0"
+description = "Local image generation tools for bop-bots - Stable Diffusion with custom models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "pillow",
+]
+
+[project.scripts]
+generate = "ai_image_tools.generate:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
