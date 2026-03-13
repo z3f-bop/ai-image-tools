@@ -194,12 +194,8 @@ def load_faceid_weights(pipe, sdxl: bool, device: str, dtype: torch.dtype):
 
 def load_ipadapter_plus_weights(pipe, sdxl: bool):
     """
-    Download (if needed) and load IP-Adapter Plus weights for style/appearance transfer.
-
-    Uses CLIP ViT-H to encode the full image — captures hair, clothing, accessories,
-    colors, and textures. No InsightFace required.
-
-    Files are cached in ~/.cache/huggingface/hub/ via hf_hub_download.
+    Download (if needed) and load IP-Adapter Plus adapter weights only.
+    Image encoding is handled separately via encode_style_image().
     """
     from huggingface_hub import hf_hub_download
 
@@ -210,17 +206,63 @@ def load_ipadapter_plus_weights(pipe, sdxl: bool):
         weight_name = IPADAPTER_PLUS_SD15
         subfolder = "models"
 
-    # Trigger cache download so the file is local before load_ip_adapter
     filename = weight_name.split("/")[-1]
     print(f"Downloading IP-Adapter Plus weights ({filename})...")
     hf_hub_download(repo_id=IPADAPTER_REPO, filename=weight_name)
 
-    print("Loading IP-Adapter Plus...")
+    print("Loading IP-Adapter Plus adapter weights...")
     pipe.load_ip_adapter(
         IPADAPTER_REPO,
         subfolder=subfolder,
         weight_name=filename,
     )
+
+
+def encode_style_image(style_ref_path: str, sdxl: bool, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Encode a style reference image using CLIP ViT-H from the IP-Adapter repo.
+
+    IP-Adapter Plus uses hidden_states[-2] (penultimate layer), NOT the final
+    projected output — this is what distinguishes Plus from basic IP-Adapter.
+    Bypasses the pipeline's own CLIP to avoid SDXL's ViT-bigG (1664-dim)
+    being used instead of ViT-H (1280-dim).
+    """
+    from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
+
+    # Both SD1.5 and SDXL _vit-h variants use the same ViT-H encoder at models/image_encoder.
+    # sdxl_models/image_encoder contains ViT-bigG (1664-dim) used by the non-vit-h SDXL adapter.
+    encoder_subfolder = "models/image_encoder"
+    print(f"Loading CLIP ViT-H encoder from {encoder_subfolder}...")
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        IPADAPTER_REPO,
+        subfolder=encoder_subfolder,
+        torch_dtype=dtype,
+    ).to(device)
+
+    clip_processor = CLIPImageProcessor()
+    pil_image = Image.open(style_ref_path).convert("RGB")
+    pixel_values = clip_processor(images=pil_image, return_tensors="pt").pixel_values.to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        # Plus variant needs penultimate hidden state, not final projection
+        image_embeds = image_encoder(pixel_values, output_hidden_states=True).hidden_states[-2]
+        # Negative embed is zeros (uncond)
+        negative_image_embeds = torch.zeros_like(image_embeds)
+
+    # MultiIPAdapterImageProjection expects [batch, num_images, seq, dim].
+    # Add num_images=1 dimension before stacking [uncond, cond] on batch axis.
+    # Without this, [2, 257, 1280] is misread as batch=2, num_images=257.
+    image_embeds = image_embeds.unsqueeze(1)           # [1, 1, 257, 1280]
+    negative_image_embeds = negative_image_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
+    embeds = torch.cat([negative_image_embeds, image_embeds])   # [2, 1, 257, 1280]
+    print(f"Style embedding extracted (shape: {embeds.shape})")
+
+    # Free encoder from device memory
+    del image_encoder
+    if device == "mps":
+        torch.mps.empty_cache()
+
+    return embeds
 
 
 def generate(
@@ -294,16 +336,12 @@ def generate(
     # Move to device
     pipe = pipe.to(device)
 
-    # Enable memory optimization
-    if device == "mps":
-        pipe.enable_attention_slicing()
-
     # For SDXL on limited VRAM, enable more aggressive optimizations
     if sdxl:
         try:
-            pipe.enable_vae_slicing()
+            pipe.vae.enable_slicing()
         except Exception:
-            pass  # Not all pipelines support this
+            pass
 
     # Load user LoRA if specified (loaded before FaceID LoRA to avoid conflicts)
     if lora_path:
@@ -327,13 +365,19 @@ def generate(
         print(f"Face reference enabled (weight: {face_weight})")
 
     # Style reference: full appearance transfer via IP-Adapter Plus (CLIP ViT-H)
-    style_image = None
+    style_embeds = None
     if style_ref:
-        print(f"Loading style reference image: {style_ref}")
-        style_image = Image.open(style_ref).convert("RGB")
         load_ipadapter_plus_weights(pipe, sdxl=sdxl)
+        style_embeds = encode_style_image(style_ref, sdxl=sdxl, device=device, dtype=dtype)
         pipe.set_ip_adapter_scale(style_weight)
         print(f"Style reference enabled (weight: {style_weight})")
+
+    # Attention slicing is incompatible with IP-Adapter: enable_attention_slicing()
+    # replaces all attention processors (including IPAdapterAttnProcessor2_0) with
+    # SlicedAttnProcessor, breaking the IP-Adapter cross-attention path.
+    # Only enable when not using IP-Adapter.
+    if device == "mps" and face_ref is None and style_ref is None:
+        pipe.enable_attention_slicing()
 
     # Set seed for reproducibility
     generator = None
@@ -366,9 +410,9 @@ def generate(
     if face_embeds is not None:
         gen_kwargs["ip_adapter_image_embeds"] = [face_embeds]
 
-    # Pass style image directly (plain IP-Adapter Plus takes a PIL Image)
-    if style_image is not None:
-        gen_kwargs["ip_adapter_image"] = style_image
+    # Pass style embeds (encoded manually with ViT-H to avoid SDXL's ViT-bigG mismatch)
+    if style_embeds is not None:
+        gen_kwargs["ip_adapter_image_embeds"] = [style_embeds]
 
     result = pipe(**gen_kwargs)
 
