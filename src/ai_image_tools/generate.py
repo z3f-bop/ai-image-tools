@@ -61,7 +61,7 @@ IPADAPTER_PLUS_SDXL = "sdxl_models/ip-adapter-plus_sdxl_vit-h.bin"
 def get_device():
     """Detect best available device."""
     if torch.backends.mps.is_available():
-        return "mps", torch.float32  # MPS needs float32
+        return "mps", torch.float32  # dtype is overridden per model type in generate()
     elif torch.cuda.is_available():
         return "cuda", torch.float16
     else:
@@ -192,77 +192,32 @@ def load_faceid_weights(pipe, sdxl: bool, device: str, dtype: torch.dtype):
     return adapter_path, lora_path
 
 
-def load_ipadapter_plus_weights(pipe, sdxl: bool):
+def load_ipadapter_plus_weights(pipe, sdxl: bool, device: str = "cpu"):
     """
-    Download (if needed) and load IP-Adapter Plus adapter weights only.
-    Image encoding is handled separately via encode_style_image().
-    """
-    from huggingface_hub import hf_hub_download
+    Download and load IP-Adapter Plus adapter weights + ViT-H image encoder.
 
+    Always loads the ViT-H encoder (models/image_encoder), even for SDXL Plus,
+    because the sdxl_models/ path contains ViT-bigG (1664-dim) which is the
+    wrong shape. ViT-H (1280-dim) is what ip-adapter-plus_sdxl_vit-h.bin expects.
+
+    The pipeline auto-detects Plus adapters and uses hidden_states[-2] encoding
+    internally, including correct uncond embeds from a zero-pixel CLIP input.
+    """
     if sdxl:
-        weight_name = IPADAPTER_PLUS_SDXL
         subfolder = "sdxl_models"
+        filename = IPADAPTER_PLUS_SDXL.split("/")[-1]
     else:
-        weight_name = IPADAPTER_PLUS_SD15
         subfolder = "models"
+        filename = IPADAPTER_PLUS_SD15.split("/")[-1]
 
-    filename = weight_name.split("/")[-1]
-    print(f"Downloading IP-Adapter Plus weights ({filename})...")
-    hf_hub_download(repo_id=IPADAPTER_REPO, filename=weight_name)
-
-    print("Loading IP-Adapter Plus adapter weights...")
+    print(f"Loading IP-Adapter Plus ({filename}) with ViT-H encoder...")
     pipe.load_ip_adapter(
         IPADAPTER_REPO,
         subfolder=subfolder,
         weight_name=filename,
+        image_encoder_folder="models/image_encoder",
     )
 
-
-def encode_style_image(style_ref_path: str, sdxl: bool, device: str, dtype: torch.dtype) -> torch.Tensor:
-    """
-    Encode a style reference image using CLIP ViT-H from the IP-Adapter repo.
-
-    IP-Adapter Plus uses hidden_states[-2] (penultimate layer), NOT the final
-    projected output — this is what distinguishes Plus from basic IP-Adapter.
-    Bypasses the pipeline's own CLIP to avoid SDXL's ViT-bigG (1664-dim)
-    being used instead of ViT-H (1280-dim).
-    """
-    from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
-
-    # Both SD1.5 and SDXL _vit-h variants use the same ViT-H encoder at models/image_encoder.
-    # sdxl_models/image_encoder contains ViT-bigG (1664-dim) used by the non-vit-h SDXL adapter.
-    encoder_subfolder = "models/image_encoder"
-    print(f"Loading CLIP ViT-H encoder from {encoder_subfolder}...")
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        IPADAPTER_REPO,
-        subfolder=encoder_subfolder,
-        torch_dtype=dtype,
-    ).to(device)
-
-    clip_processor = CLIPImageProcessor()
-    pil_image = Image.open(style_ref_path).convert("RGB")
-    pixel_values = clip_processor(images=pil_image, return_tensors="pt").pixel_values.to(device=device, dtype=dtype)
-
-    with torch.no_grad():
-        # Plus variant needs penultimate hidden state, not final projection
-        image_embeds = image_encoder(pixel_values, output_hidden_states=True).hidden_states[-2]
-        # Negative embed is zeros (uncond)
-        negative_image_embeds = torch.zeros_like(image_embeds)
-
-    # MultiIPAdapterImageProjection expects [batch, num_images, seq, dim].
-    # Add num_images=1 dimension before stacking [uncond, cond] on batch axis.
-    # Without this, [2, 257, 1280] is misread as batch=2, num_images=257.
-    image_embeds = image_embeds.unsqueeze(1)           # [1, 1, 257, 1280]
-    negative_image_embeds = negative_image_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
-    embeds = torch.cat([negative_image_embeds, image_embeds])   # [2, 1, 257, 1280]
-    print(f"Style embedding extracted (shape: {embeds.shape})")
-
-    # Free encoder from device memory
-    del image_encoder
-    if device == "mps":
-        torch.mps.empty_cache()
-
-    return embeds
 
 
 def generate(
@@ -293,6 +248,14 @@ def generate(
 
     model_type = "SDXL" if sdxl else "SD 1.5"
     print(f"Model type: {model_type}")
+
+    # MPS dtype override:
+    # - SDXL always needs float16 to avoid grey/blob VAE artifacts.
+    # - SD 1.5 + IP-Adapter Plus needs float16 because the resampler's SDPA
+    #   produces NaN in float32 on MPS (query/key/value must all share dtype).
+    # - SD 1.5 without IP-Adapter is fine with float32.
+    if device == "mps" and (sdxl or style_ref):
+        dtype = torch.float16
 
     # Set default dimensions based on model type
     # Note: MPS struggles with 896x1152, 768x1024 is more stable
@@ -336,6 +299,15 @@ def generate(
     # Move to device
     pipe = pipe.to(device)
 
+    # MPS: VAE decoder in float16 produces noisy/black output on MPS.
+    # upcast_vae() forces the VAE decode step to float32 while keeping the rest float16.
+    # Required for SDXL always, and for SD 1.5 when running in float16 (i.e. with IP-Adapter).
+    # SDXL on MPS: VAE decoder in float16 produces grey/noisy output.
+    # upcast_vae() forces the decode step to float32 while keeping UNet in float16.
+    # SD 1.5 VAE is stable in float16 — no special handling needed.
+    if device == "mps" and sdxl:
+        pipe.upcast_vae()
+
     # For SDXL on limited VRAM, enable more aggressive optimizations
     if sdxl:
         try:
@@ -365,10 +337,8 @@ def generate(
         print(f"Face reference enabled (weight: {face_weight})")
 
     # Style reference: full appearance transfer via IP-Adapter Plus (CLIP ViT-H)
-    style_embeds = None
     if style_ref:
-        load_ipadapter_plus_weights(pipe, sdxl=sdxl)
-        style_embeds = encode_style_image(style_ref, sdxl=sdxl, device=device, dtype=dtype)
+        load_ipadapter_plus_weights(pipe, sdxl=sdxl, device=device)
         pipe.set_ip_adapter_scale(style_weight)
         print(f"Style reference enabled (weight: {style_weight})")
 
@@ -410,9 +380,10 @@ def generate(
     if face_embeds is not None:
         gen_kwargs["ip_adapter_image_embeds"] = [face_embeds]
 
-    # Pass style embeds (encoded manually with ViT-H to avoid SDXL's ViT-bigG mismatch)
-    if style_embeds is not None:
-        gen_kwargs["ip_adapter_image_embeds"] = [style_embeds]
+    # Pass style image — pipeline encodes it with ViT-H using hidden_states[-2]
+    # (auto-detected as Plus adapter; correct uncond from zero-pixel CLIP input)
+    if style_ref:
+        gen_kwargs["ip_adapter_image"] = Image.open(style_ref).convert("RGB")
 
     result = pipe(**gen_kwargs)
 
