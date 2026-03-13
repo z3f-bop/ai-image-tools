@@ -3,14 +3,26 @@
 Local image generation using Stable Diffusion with custom models.
 
 Supports:
-- Custom .safetensors models from CivitAI
+- SD 1.5 models (.safetensors from CivitAI)
+- SDXL models (Pony, Illustrious, etc.)
 - LoRA style tuning
+- IP-Adapter FaceID Plus v2 face reference
+- IP-Adapter Plus style reference (hair, clothing, accessories, colors)
 - MPS (Mac), CUDA (Linux/Windows), CPU fallback
 - No content filters
 
 Usage:
-    python -m ai_image_tools.generate --prompt "anime girl with pink hair" --model anime-v5
-    python -m ai_image_tools.generate --prompt "..." --model anime-v5 --lora style-lora
+    # SD 1.5 (default)
+    python -m ai_image_tools.generate --prompt "..." --model meinamix-v12
+
+    # SDXL (auto-detected or explicit)
+    python -m ai_image_tools.generate --prompt "..." --model pony-v6 --sdxl
+
+    # With face reference
+    python -m ai_image_tools.generate --prompt "..." --model meinamix-v12 --face-ref photo.jpg
+
+    # With style reference (full appearance transfer via IP-Adapter Plus)
+    python -m ai_image_tools.generate --prompt "..." --model meinamix-v12 --style-ref outfit.jpg
 """
 
 import argparse
@@ -19,8 +31,31 @@ from pathlib import Path
 from datetime import datetime
 
 import torch
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import (
+    StableDiffusionPipeline,
+    StableDiffusionXLPipeline,
+    DPMSolverMultistepScheduler,
+    EulerDiscreteScheduler,
+)
 from PIL import Image
+
+
+# SDXL models are typically >4GB, SD 1.5 models are ~2GB
+SDXL_SIZE_THRESHOLD = 4 * 1024 * 1024 * 1024  # 4GB
+
+# IP-Adapter FaceID Plus v2 HuggingFace repo
+FACEID_REPO = "h94/IP-Adapter-FaceID"
+
+# Model-type-specific adapter and LoRA filenames
+FACEID_ADAPTER_SD15 = "ip-adapter-faceid-plusv2_sd15.bin"
+FACEID_LORA_SD15 = "ip-adapter-faceid-plusv2_sd15_lora.safetensors"
+FACEID_ADAPTER_SDXL = "ip-adapter-faceid-plusv2_sdxl.bin"
+FACEID_LORA_SDXL = "ip-adapter-faceid-plusv2_sdxl_lora.safetensors"
+
+# IP-Adapter Plus (style/appearance transfer via CLIP ViT-H, no InsightFace)
+IPADAPTER_REPO = "h94/IP-Adapter"
+IPADAPTER_PLUS_SD15 = "models/ip-adapter-plus_sd15.bin"
+IPADAPTER_PLUS_SDXL = "sdxl_models/ip-adapter-plus_sdxl_vit-h.bin"
 
 
 def get_device():
@@ -31,6 +66,12 @@ def get_device():
         return "cuda", torch.float16
     else:
         return "cpu", torch.float32
+
+
+def is_sdxl_model(model_path: Path) -> bool:
+    """Detect if model is SDXL based on file size."""
+    size = model_path.stat().st_size
+    return size > SDXL_SIZE_THRESHOLD
 
 
 def find_model(model_name: str, models_dir: Path) -> Path:
@@ -75,12 +116,111 @@ def find_lora(lora_name: str, loras_dir: Path) -> Path:
 
 
 def disable_safety_checker(pipe):
-    """Disable the safety checker for NSFW content."""
-    def dummy_checker(images, **kwargs):
-        return images, [False] * len(images)
-
-    pipe.safety_checker = dummy_checker
+    """Disable the safety checker for NSFW content (SD 1.5 only)."""
+    if hasattr(pipe, 'safety_checker') and pipe.safety_checker is not None:
+        def dummy_checker(images, **kwargs):
+            return images, [False] * len(images)
+        pipe.safety_checker = dummy_checker
     return pipe
+
+
+def extract_face_embedding(face_ref_path: str, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Extract face embedding from a reference image using InsightFace buffalo_l.
+
+    InsightFace uses ONNX under the hood, so CPUExecutionProvider is used
+    even on MPS systems — the face analysis always runs on CPU.
+    """
+    import cv2
+    from insightface.app import FaceAnalysis
+
+    print(f"Extracting face embedding from: {face_ref_path}")
+
+    # InsightFace requires CPUExecutionProvider on MPS (no native MPS ONNX support)
+    app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+
+    img = cv2.imread(face_ref_path)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {face_ref_path}")
+
+    faces = app.get(img)
+    if not faces:
+        raise ValueError(
+            f"No face detected in reference image: {face_ref_path}\n"
+            "Make sure the image contains a clear, visible face."
+        )
+
+    face = faces[0]
+    embedding = face.normed_embedding  # numpy array, shape (512,)
+
+    # Convert to tensor with correct dtype and device
+    face_embed = torch.from_numpy(embedding).unsqueeze(0).to(device=device, dtype=dtype)
+    print(f"Face embedding extracted (shape: {face_embed.shape})")
+    return face_embed
+
+
+def load_faceid_weights(pipe, sdxl: bool, device: str, dtype: torch.dtype):
+    """
+    Download (if needed) and load IP-Adapter FaceID Plus v2 weights and paired LoRA.
+
+    Uses hf_hub_download so files are cached in ~/.cache/huggingface/hub/.
+    """
+    from huggingface_hub import hf_hub_download
+
+    adapter_filename = FACEID_ADAPTER_SDXL if sdxl else FACEID_ADAPTER_SD15
+    lora_filename = FACEID_LORA_SDXL if sdxl else FACEID_LORA_SD15
+
+    print(f"Downloading IP-Adapter FaceID Plus v2 weights ({adapter_filename})...")
+    adapter_path = hf_hub_download(repo_id=FACEID_REPO, filename=adapter_filename)
+
+    print(f"Downloading FaceID LoRA weights ({lora_filename})...")
+    lora_path = hf_hub_download(repo_id=FACEID_REPO, filename=lora_filename)
+
+    # Load the paired LoRA first (affects UNet attention layers)
+    print("Loading FaceID LoRA into UNet...")
+    pipe.load_lora_weights(lora_path)
+
+    # Load IP-Adapter
+    print("Loading IP-Adapter FaceID Plus v2...")
+    pipe.load_ip_adapter(
+        FACEID_REPO,
+        subfolder=None,
+        weight_name=adapter_filename,
+    )
+
+    return adapter_path, lora_path
+
+
+def load_ipadapter_plus_weights(pipe, sdxl: bool):
+    """
+    Download (if needed) and load IP-Adapter Plus weights for style/appearance transfer.
+
+    Uses CLIP ViT-H to encode the full image — captures hair, clothing, accessories,
+    colors, and textures. No InsightFace required.
+
+    Files are cached in ~/.cache/huggingface/hub/ via hf_hub_download.
+    """
+    from huggingface_hub import hf_hub_download
+
+    if sdxl:
+        weight_name = IPADAPTER_PLUS_SDXL
+        subfolder = "sdxl_models"
+    else:
+        weight_name = IPADAPTER_PLUS_SD15
+        subfolder = "models"
+
+    # Trigger cache download so the file is local before load_ip_adapter
+    filename = weight_name.split("/")[-1]
+    print(f"Downloading IP-Adapter Plus weights ({filename})...")
+    hf_hub_download(repo_id=IPADAPTER_REPO, filename=weight_name)
+
+    print("Loading IP-Adapter Plus...")
+    pipe.load_ip_adapter(
+        IPADAPTER_REPO,
+        subfolder=subfolder,
+        weight_name=filename,
+    )
 
 
 def generate(
@@ -89,29 +229,67 @@ def generate(
     output_path: Path,
     lora_path: Path = None,
     negative_prompt: str = None,
-    width: int = 512,
-    height: int = 768,
+    width: int = None,
+    height: int = None,
     steps: int = 30,
     guidance: float = 7.5,
     seed: int = None,
+    sdxl: bool = None,
+    clip_skip: int = None,
+    face_ref: str = None,
+    face_weight: float = 0.8,
+    style_ref: str = None,
+    style_weight: float = 0.6,
 ):
     """Generate image from prompt using specified model."""
     device, dtype = get_device()
     print(f"Using device: {device} (dtype: {dtype})")
 
+    # Auto-detect SDXL if not specified
+    if sdxl is None:
+        sdxl = is_sdxl_model(model_path)
+
+    model_type = "SDXL" if sdxl else "SD 1.5"
+    print(f"Model type: {model_type}")
+
+    # Set default dimensions based on model type
+    # Note: MPS struggles with 896x1152, 768x1024 is more stable
+    if width is None:
+        width = 768 if sdxl else 512
+    if height is None:
+        height = 1024 if sdxl else 768
+
     # Load model
     print(f"Loading model: {model_path.name}")
-    pipe = StableDiffusionPipeline.from_single_file(
-        str(model_path),
-        torch_dtype=dtype,
-        use_safetensors=True,
-    )
 
-    # Use faster scheduler
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if sdxl:
+        pipe = StableDiffusionXLPipeline.from_single_file(
+            str(model_path),
+            torch_dtype=dtype,
+            use_safetensors=True,
+            add_watermarker=False,
+        )
+        # Set clip_skip for Pony and similar models (they need clip_skip=2)
+        if clip_skip:
+            # In diffusers, we set this via the text encoder config
+            # For SDXL, clip_skip affects the second text encoder
+            print(f"Using clip_skip: {clip_skip}")
+    else:
+        pipe = StableDiffusionPipeline.from_single_file(
+            str(model_path),
+            torch_dtype=dtype,
+            use_safetensors=True,
+        )
+        # Disable safety checker for SD 1.5
+        pipe = disable_safety_checker(pipe)
 
-    # Disable safety checker
-    pipe = disable_safety_checker(pipe)
+    # Use appropriate scheduler (Euler for SDXL/Pony, DPM for SD 1.5)
+    if sdxl:
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        print("Using scheduler: Euler (recommended for Pony/SDXL)")
+    else:
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        print("Using scheduler: DPMSolver")
 
     # Move to device
     pipe = pipe.to(device)
@@ -120,10 +298,42 @@ def generate(
     if device == "mps":
         pipe.enable_attention_slicing()
 
-    # Load LoRA if specified
+    # For SDXL on limited VRAM, enable more aggressive optimizations
+    if sdxl:
+        try:
+            pipe.enable_vae_slicing()
+        except Exception:
+            pass  # Not all pipelines support this
+
+    # Load user LoRA if specified (loaded before FaceID LoRA to avoid conflicts)
     if lora_path:
         print(f"Loading LoRA: {lora_path.name}")
         pipe.load_lora_weights(str(lora_path))
+
+    # Guard: face_ref and style_ref can't be combined (two IP-adapters simultaneously
+    # requires multi-adapter loading, not supported in this version)
+    if face_ref and style_ref:
+        raise ValueError(
+            "--face-ref and --style-ref cannot be used together. "
+            "Combining two IP-Adapters simultaneously is not supported in this version."
+        )
+
+    # Face reference: extract embedding and load IP-Adapter FaceID + paired LoRA
+    face_embeds = None
+    if face_ref:
+        face_embeds = extract_face_embedding(face_ref, device=device, dtype=dtype)
+        load_faceid_weights(pipe, sdxl=sdxl, device=device, dtype=dtype)
+        pipe.set_ip_adapter_scale(face_weight)
+        print(f"Face reference enabled (weight: {face_weight})")
+
+    # Style reference: full appearance transfer via IP-Adapter Plus (CLIP ViT-H)
+    style_image = None
+    if style_ref:
+        print(f"Loading style reference image: {style_ref}")
+        style_image = Image.open(style_ref).convert("RGB")
+        load_ipadapter_plus_weights(pipe, sdxl=sdxl)
+        pipe.set_ip_adapter_scale(style_weight)
+        print(f"Style reference enabled (weight: {style_weight})")
 
     # Set seed for reproducibility
     generator = None
@@ -138,15 +348,29 @@ def generate(
     print(f"Prompt: {prompt[:100]}...")
 
     # Generate
-    result = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt or "low quality, bad anatomy, worst quality",
-        width=width,
-        height=height,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        generator=generator,
-    )
+    gen_kwargs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt or "low quality, bad anatomy, worst quality",
+        "width": width,
+        "height": height,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "generator": generator,
+    }
+
+    # Add clip_skip for SDXL if specified
+    if sdxl and clip_skip:
+        gen_kwargs["clip_skip"] = clip_skip
+
+    # Pass face embedding via ip_adapter_image_embeds
+    if face_embeds is not None:
+        gen_kwargs["ip_adapter_image_embeds"] = [face_embeds]
+
+    # Pass style image directly (plain IP-Adapter Plus takes a PIL Image)
+    if style_image is not None:
+        gen_kwargs["ip_adapter_image"] = style_image
+
+    result = pipe(**gen_kwargs)
 
     image = result.images[0]
 
@@ -161,12 +385,21 @@ def generate(
         f.write(f"prompt: {prompt}\n")
         f.write(f"negative: {negative_prompt}\n")
         f.write(f"model: {model_path.name}\n")
+        f.write(f"model_type: {model_type}\n")
         if lora_path:
             f.write(f"lora: {lora_path.name}\n")
         f.write(f"seed: {seed}\n")
         f.write(f"steps: {steps}\n")
         f.write(f"guidance: {guidance}\n")
         f.write(f"size: {width}x{height}\n")
+        if clip_skip:
+            f.write(f"clip_skip: {clip_skip}\n")
+        if face_ref:
+            f.write(f"face_ref: {Path(face_ref).name}\n")
+            f.write(f"face_weight: {face_weight}\n")
+        if style_ref:
+            f.write(f"style_ref: {Path(style_ref).name}\n")
+            f.write(f"style_weight: {style_weight}\n")
 
     return output_path
 
@@ -201,14 +434,12 @@ def main():
     parser.add_argument(
         "--width", "-W",
         type=int,
-        default=512,
-        help="Image width (default: 512)"
+        help="Image width (default: 512 for SD1.5, 768 for SDXL)"
     )
     parser.add_argument(
         "--height", "-H",
         type=int,
-        default=768,
-        help="Image height (default: 768)"
+        help="Image height (default: 768 for SD1.5, 1024 for SDXL)"
     )
     parser.add_argument(
         "--steps", "-s",
@@ -227,6 +458,40 @@ def main():
         type=int,
         help="Random seed for reproducibility"
     )
+    parser.add_argument(
+        "--sdxl",
+        action="store_true",
+        help="Force SDXL mode (auto-detected by file size otherwise)"
+    )
+    parser.add_argument(
+        "--clip-skip",
+        type=int,
+        default=None,
+        help="Clip skip value (Pony models need --clip-skip 2)"
+    )
+    parser.add_argument(
+        "--face-ref",
+        metavar="PATH",
+        help="Path to reference face image for IP-Adapter FaceID Plus v2"
+    )
+    parser.add_argument(
+        "--face-weight",
+        type=float,
+        default=0.8,
+        help="IP-Adapter face anchoring strength (default: 0.8)"
+    )
+    parser.add_argument(
+        "--style-ref",
+        metavar="PATH",
+        help="Path to reference image for IP-Adapter Plus style/appearance transfer "
+             "(hair, clothing, accessories, colors — cannot combine with --face-ref)"
+    )
+    parser.add_argument(
+        "--style-weight",
+        type=float,
+        default=0.6,
+        help="IP-Adapter Plus style transfer strength (default: 0.6)"
+    )
 
     args = parser.parse_args()
 
@@ -243,6 +508,14 @@ def main():
     lora_path = None
     if args.lora:
         lora_path = find_lora(args.lora, loras_dir)
+
+    # Validate face-ref path if provided
+    if args.face_ref and not Path(args.face_ref).exists():
+        raise FileNotFoundError(f"Face reference image not found: {args.face_ref}")
+
+    # Validate style-ref path if provided
+    if args.style_ref and not Path(args.style_ref).exists():
+        raise FileNotFoundError(f"Style reference image not found: {args.style_ref}")
 
     # Output path
     if args.output:
@@ -263,6 +536,12 @@ def main():
         steps=args.steps,
         guidance=args.guidance,
         seed=args.seed,
+        sdxl=args.sdxl if args.sdxl else None,
+        clip_skip=args.clip_skip,
+        face_ref=args.face_ref,
+        face_weight=args.face_weight,
+        style_ref=args.style_ref,
+        style_weight=args.style_weight,
     )
 
 

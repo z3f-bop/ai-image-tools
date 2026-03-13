@@ -10,6 +10,9 @@ dependencies = [
     "accelerate",
     "safetensors",
     "pillow",
+    "insightface",
+    "opencv-python",
+    "onnxruntime",
 ]
 
 [project.scripts]
